@@ -11,6 +11,7 @@ const GOOGLE_PLACES_API_KEY = Deno.env.get("GOOGLE_PLACES_API_KEY") ?? "";
 const CATEGORIES: LeadCategory[] = ["RESTAURANT", "HAIR", "HOME_SERVICES"];
 const WEEKLY_TILE_SLICE = 33;
 const WEEKLY_CALL_LIMIT_FROM_TILE_RULE = 100; // weekly_tiles * 3 must be <= 100
+const TILE_BATCH_SIZE = 5;
 const SEARCH_RADIUS_METERS = 2000;
 const MAX_API_CALLS = 400;
 const MAX_RETRIES = 3;
@@ -168,6 +169,17 @@ Deno.serve(async (req) => {
       0,
     ) ?? 0;
 
+    const staleThreshold = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    await supabase
+      .from("crawl_runs")
+      .update({
+        status: "FAILED",
+        error_message: "Orphaned: function timeout",
+        completed_at: new Date().toISOString(),
+      })
+      .eq("status", "RUNNING")
+      .lt("created_at", staleThreshold);
+
     const runInsert = await supabase
       .from("crawl_runs")
       .insert({
@@ -193,6 +205,7 @@ Deno.serve(async (req) => {
       .select("id, centroid_lat, centroid_lng")
       .eq("is_active", true)
       .order("last_crawled_at", { ascending: true, nullsFirst: true })
+      .order("tile_key", { ascending: true })
       .limit(effectiveWeeklyTileSlice);
 
     if (tileQuery.error) {
@@ -201,104 +214,108 @@ Deno.serve(async (req) => {
 
     const selectedTiles = (tileQuery.data ?? []) as TileRow[];
 
-    for (const tile of selectedTiles) {
-      for (const category of CATEGORIES) {
-        const nearbyType = CATEGORY_TO_NEARBY_TYPE[category];
-        const allResults: NearbyResult[] = [];
-        let nextPageToken: string | undefined;
-        let page = 0;
+    for (let i = 0; i < selectedTiles.length; i += TILE_BATCH_SIZE) {
+      const batch = selectedTiles.slice(i, i + TILE_BATCH_SIZE);
 
-        do {
-          consumeApiBudget();
+      await Promise.all(batch.map(async (tile) => {
+        for (const category of CATEGORIES) {
+          const nearbyType = CATEGORY_TO_NEARBY_TYPE[category];
+          const allResults: NearbyResult[] = [];
+          let nextPageToken: string | undefined;
+          let page = 0;
 
-          const baseUrl = new URL("https://maps.googleapis.com/maps/api/place/nearbysearch/json");
-          baseUrl.searchParams.set("key", GOOGLE_PLACES_API_KEY);
+          do {
+            consumeApiBudget();
 
-          if (nextPageToken) {
-            await sleep(PLACE_NEXT_PAGE_DELAY_MS);
-            baseUrl.searchParams.set("pagetoken", nextPageToken);
-          } else {
-            baseUrl.searchParams.set("location", `${tile.centroid_lat},${tile.centroid_lng}`);
-            baseUrl.searchParams.set("radius", String(SEARCH_RADIUS_METERS));
-            baseUrl.searchParams.set("type", nearbyType);
+            const baseUrl = new URL("https://maps.googleapis.com/maps/api/place/nearbysearch/json");
+            baseUrl.searchParams.set("key", GOOGLE_PLACES_API_KEY);
+
+            if (nextPageToken) {
+              await sleep(PLACE_NEXT_PAGE_DELAY_MS);
+              baseUrl.searchParams.set("pagetoken", nextPageToken);
+            } else {
+              baseUrl.searchParams.set("location", `${tile.centroid_lat},${tile.centroid_lng}`);
+              baseUrl.searchParams.set("radius", String(SEARCH_RADIUS_METERS));
+              baseUrl.searchParams.set("type", nearbyType);
+            }
+
+            const response = await fetchWithRetry(baseUrl.toString(), MAX_RETRIES);
+            apiCalls += 1;
+
+            if (!response.ok) {
+              throw new Error(`Nearby Search HTTP ${response.status}`);
+            }
+
+            const payload = (await response.json()) as NearbyResponse;
+
+            if (payload.status !== "OK" && payload.status !== "ZERO_RESULTS") {
+              throw new Error(`Nearby Search error status: ${payload.status}`);
+            }
+
+            if (payload.results?.length) {
+              allResults.push(...payload.results);
+            }
+
+            nextPageToken = payload.next_page_token;
+            page += 1;
+          } while (nextPageToken && page < 3);
+
+          const upserts = allResults
+            .filter((r) => r.place_id && r.geometry?.location)
+            .map((r) => {
+              const lat = r.geometry!.location!.lat;
+              const lng = r.geometry!.location!.lng;
+              const reviewsCount = r.user_ratings_total ?? null;
+              const rating = r.rating ?? null;
+
+              return {
+                place_id: r.place_id,
+                name: r.name ?? "UNKNOWN",
+                geom: `SRID=4326;POINT(${lng} ${lat})`,
+                rating,
+                reviews_count: reviewsCount,
+                website: null,
+                website_type: "NO_WEBSITE",
+                main_category: category,
+                score: scoreBusinessByCategory(category, rating ?? undefined, reviewsCount ?? undefined),
+                score_version: SCORE_VERSION,
+                last_seen: new Date().toISOString(),
+                is_active: true,
+                last_refreshed: new Date().toISOString(),
+                source_payload: {
+                  types: r.types ?? [],
+                },
+              };
+            });
+
+          if (upserts.length > 0) {
+            const upsertResult = await supabase.from("businesses").upsert(upserts, {
+              onConflict: "place_id",
+              ignoreDuplicates: false,
+            });
+
+            if (upsertResult.error) {
+              throw new Error(`Business upsert failed: ${upsertResult.error.message}`);
+            }
           }
 
-          const response = await fetchWithRetry(baseUrl.toString(), MAX_RETRIES);
-          apiCalls += 1;
-
-          if (!response.ok) {
-            throw new Error(`Nearby Search HTTP ${response.status}`);
-          }
-
-          const payload = (await response.json()) as NearbyResponse;
-
-          if (payload.status !== "OK" && payload.status !== "ZERO_RESULTS") {
-            throw new Error(`Nearby Search error status: ${payload.status}`);
-          }
-
-          if (payload.results?.length) {
-            allResults.push(...payload.results);
-          }
-
-          nextPageToken = payload.next_page_token;
-          page += 1;
-        } while (nextPageToken && page < 3);
-
-        const upserts = allResults
-          .filter((r) => r.place_id && r.geometry?.location)
-          .map((r) => {
-            const lat = r.geometry!.location!.lat;
-            const lng = r.geometry!.location!.lng;
-            const reviewsCount = r.user_ratings_total ?? null;
-            const rating = r.rating ?? null;
-
-            return {
-              place_id: r.place_id,
-              name: r.name ?? "UNKNOWN",
-              geom: `SRID=4326;POINT(${lng} ${lat})`,
-              rating,
-              reviews_count: reviewsCount,
-              website: null,
-              website_type: "NO_WEBSITE",
-              main_category: category,
-              score: scoreBusinessByCategory(category, rating ?? undefined, reviewsCount ?? undefined),
-              score_version: SCORE_VERSION,
-              last_seen: new Date().toISOString(),
-              is_active: true,
-              last_refreshed: new Date().toISOString(),
-              source_payload: {
-                types: r.types ?? [],
-              },
-            };
-          });
-
-        if (upserts.length > 0) {
-          const upsertResult = await supabase.from("businesses").upsert(upserts, {
-            onConflict: "place_id",
-            ignoreDuplicates: false,
-          });
-
-          if (upsertResult.error) {
-            throw new Error(`Business upsert failed: ${upsertResult.error.message}`);
+          totalResults += allResults.length;
+          if (allResults.length >= 60) {
+            tilesHit60Limit += 1;
           }
         }
 
-        totalResults += allResults.length;
-        if (allResults.length >= 60) {
-          tilesHit60Limit += 1;
+        const touchTile = await supabase
+          .from("grid_tiles")
+          .update({ last_crawled_at: new Date().toISOString() })
+          .eq("id", tile.id);
+
+        if (touchTile.error) {
+          throw new Error(`Tile update failed: ${touchTile.error.message}`);
         }
-      }
 
-      const touchTile = await supabase
-        .from("grid_tiles")
-        .update({ last_crawled_at: new Date().toISOString() })
-        .eq("id", tile.id);
-
-      if (touchTile.error) {
-        throw new Error(`Tile update failed: ${touchTile.error.message}`);
-      }
-
-      tilesProcessed += 1;
+        tilesProcessed += 1;
+      }));
     }
 
     const inactiveCutoff = new Date(Date.now() - INACTIVE_AFTER_DAYS * 24 * 60 * 60 * 1000).toISOString();
