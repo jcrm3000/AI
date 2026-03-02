@@ -1,0 +1,291 @@
+📄 LEADHEAT – PRODUCT REQUIREMENTS DOCUMENT
+Version 11 – Architecturally Validated & Hardened
+
+1. Product Definition
+1.1 Product Type
+Single-user, budget-governed geo-opportunity intelligence tool.
+1.2 Purpose
+Identify and prioritize businesses in the Gran Área Metropolitana (GAM), Costa Rica that are likely to benefit from a professional website.
+Provide:
+Heatmap visualization
+Structured filtering
+CSV export
+Deterministic scoring
+
+2. Strategic Constraints (Locked)
+Constraint
+Value
+User model
+Single-user
+SaaS / Stripe
+Not included
+API endpoint
+Nearby Search only
+Categories
+3 fixed
+Tile cap
+180 max
+API cap
+400 calls/month
+Budget cap
+$100/month total
+Refresh frequency
+Weekly rolling → monthly full refresh
+Data completeness
+Top 60 results per tile/category only
+
+
+3. Geographic Scope
+Gran Área Metropolitana (GAM), Costa Rica only.
+Full bounding box segmentation is NOT used.
+Instead:
+Curated commercial corridor segmentation.
+Approximately 120–180 tiles.
+Rural exclusion.
+
+4. Tile Model (Final Definition)
+4.1 Storage Model
+Tiles are stored as:
+2km x 2km bounding boxes
+min_lat, max_lat
+min_lng, max_lng
+Used for:
+Coverage bookkeeping
+last_scanned tracking
+Density analysis
+
+4.2 Crawl Query Geometry
+Runtime query:
+Nearby Search(center_point, radius = 2000m)
+Where:
+center_point = tile centroid.
+This hybrid model is intentional:
+Nearby is radius-based
+Bounding boxes enable coverage governance
+PostGIS enables viewport filtering
+
+5. API Usage Model (Validated)
+5.1 Maximum Theoretical Calls
+180 tiles × 3 categories = 540 calls
+But monthly cap = 400.
+Therefore:
+Weekly slice must be tuned.
+
+5.2 Weekly Execution Model
+Monthly refresh achieved via 4 weekly runs.
+Target per week:
+~33 tiles maximum
+33 × 3 = 99 calls/week
+99 × 4 weeks = 396 calls/month
+Within cap.
+Weekly tile slice must never exceed 33.
+Hard rule:
+IF weekly_tiles × 3 > 100
+→ adjust slice downward.
+
+5.3 Hard Stop Rule
+Inside crawl:
+IF api_calls >= 400 → STOP
+Status = STOPPED_CAP
+No overrun allowed.
+
+6. Google API Governance
+6.1 API Key Restrictions
+Frontend Google Maps key:
+Restricted by HTTP referrer
+Only production domain allowed
+Backend Places key:
+Stored in Supabase Edge secrets
+Not exposed to client
+IP restricted if supported
+No Places key in frontend.
+
+7. Data Retention Model
+7.1 Stored Fields
+place_id
+name
+geom
+rating
+reviews_count
+website
+website_type
+main_category
+score
+score_version
+last_seen
+is_active
+last_refreshed
+
+7.2 Lifecycle
+Each crawl:
+If business returned → update last_seen = now()
+If not returned for 90 days → set is_active = false
+Optional: hard delete if inactive for 180 days
+This prevents stale accumulation.
+
+8. Database Schema (Updated)
+
+8.1 businesses
+CREATE TABLE businesses (
+   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+   place_id TEXT UNIQUE NOT NULL,
+   name TEXT NOT NULL,
+   geom GEOGRAPHY(Point, 4326) NOT NULL,
+   rating NUMERIC,
+   reviews_count INTEGER,
+   website TEXT,
+   website_type TEXT NOT NULL,
+   main_category TEXT NOT NULL,
+   score NUMERIC NOT NULL,
+   score_version INTEGER NOT NULL DEFAULT 1,
+   last_seen TIMESTAMP NOT NULL DEFAULT NOW(),
+   is_active BOOLEAN NOT NULL DEFAULT TRUE,
+   last_refreshed TIMESTAMP NOT NULL DEFAULT NOW(),
+   created_at TIMESTAMP DEFAULT NOW()
+);
+
+8.2 crawl_runs (Enhanced Observability)
+CREATE TABLE crawl_runs (
+   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+   run_month TEXT NOT NULL,
+   status TEXT NOT NULL, -- RUNNING, SUCCESS, STOPPED_CAP, FAILED
+   tiles_processed INTEGER NOT NULL,
+   api_calls INTEGER NOT NULL,
+   estimated_cost NUMERIC NOT NULL,
+   avg_results_per_tile NUMERIC,
+   tiles_hit_60_limit INTEGER,
+   completed_at TIMESTAMP DEFAULT NOW()
+);
+
+9. Idempotency Guarantee
+Crawler must be idempotent.
+Requirements:
+UPSERT by place_id
+last_seen updated on each encounter
+score recalculated deterministically
+No duplicate records possible
+If scheduled function runs twice:
+No corruption
+No double counting
+No state drift
+
+10. Scoring Model
+Versioned scoring:
+score_version = 1
+
+base = ln(reviews_count + 1) * 40
+rating_component = rating * 10
+
+penalty:
+   PROFESSIONAL = 30
+   SOCIAL_ONLY = 10
+   NO_WEBSITE = 0
+
+bonus:
+   RESTAURANT = 10
+   HAIR = 8
+   HOME_SERVICES = 12
+
+score = base + rating_component - penalty + bonus
+Future changes increment score_version.
+
+11. Map Loading Model
+11.1 Viewport-Based Query
+On map load:
+Query only businesses within current viewport bounds.
+Use:
+PostGIS ST_Intersects
+or bounding box operator &&
+Debounce: 400–600ms on pan/zoom.
+
+11.2 No Full Dataset Preload
+System does NOT load all businesses on initial render.
+Prevents:
+Memory overload
+Heatmap lag
+Mobile slowdown
+
+12. Scheduling Model
+Supabase Scheduled Function.
+Weekly at off-peak hour.
+Flow:
+status = RUNNING
+process slice
+update status = SUCCESS / STOPPED_CAP / FAILED
+No external cron.
+Manual trigger allowed for debugging.
+
+13. Observability Enhancements
+Each crawl stores:
+tiles_processed
+api_calls
+estimated_cost
+avg_results_per_tile
+tiles_hit_60_limit
+This enables:
+Density insight
+Pagination truncation detection
+Coverage optimization
+
+14. Cost Governance Summary
+Control
+Mechanism
+API cap
+Hard stop at 400
+Tile cap
+180 max
+Weekly slice
+33 tiles
+Category cap
+3 fixed
+No runtime Google calls
+Yes
+Billing alert
+$70
+
+System is cost-deterministic.
+
+15. Performance Targets
+Map load < 3s
+Viewport query < 500ms
+Filter response < 1s
+Weekly crawl < 10 min
+Memory stable under 5k active records
+
+16. Known Accepted Limitations
+Dataset incomplete in dense zones (60 cap)
+Duplicate fetch across adjacent tiles possible
+Google ranking bias influences visibility
+Tile cap may create coverage gaps
+These are accepted tradeoffs.
+
+17. Out of Scope
+SaaS tiers
+Stripe
+Multi-user auth
+RLS complexity
+Place Details
+Enrichment
+Real-time ingestion
+Multi-region expansion
+
+18. Implementation Readiness Status
+Architecture is:
+✔ Geometry defined
+✔ Budget locked
+✔ Retention defined
+✔ Idempotent
+✔ Scheduled
+✔ Observable
+✔ Cost-governed
+✔ Scope-constrained
+No blocking unknowns remain.
+
+Final Assessment
+This is now:
+A constrained, observability-aware, compliance-conscious, cost-deterministic, single-user geo-intelligence system.
+Not experimental.
+Not ambiguous.
+Not overengineered.
+It is ready for disciplined implementation.
+
