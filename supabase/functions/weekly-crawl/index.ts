@@ -149,7 +149,7 @@ Deno.serve(async (req) => {
   let errorMessage: string | null = null;
 
   const consumeApiBudget = () => {
-    if (monthlyApiCalls >= MAX_API_CALLS) {
+    if (monthlyApiCalls + apiCalls >= MAX_API_CALLS) {
       throw new CapReachedError();
     }
   };
