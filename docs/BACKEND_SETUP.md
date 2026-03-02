@@ -1,5 +1,10 @@
 # LeadHeat backend setup (PRD v11)
 
+> **🔒 SCHEMA LOCKED — v11 (March 2026)**
+> This schema is frozen. No columns, tables, or constraints may be added,
+> removed, or altered without a PRD amendment approved by the PM.
+> All implementation must target this exact schema.
+
 ## 1) What is implemented
 
 - Supabase Postgres + PostGIS schema
@@ -96,3 +101,14 @@ In [supabase/functions/weekly-crawl/index.ts](supabase/functions/weekly-crawl/in
 - `INACTIVE_AFTER_DAYS = 90`
 - `PURGE_AFTER_DAYS = 180`
 - `ENABLE_PURGE = false` (safe default)
+
+## 8) Known Accepted Risks
+
+| # | Risk | Impact | Mitigation |
+|---|------|--------|------------|
+| 1 | **60-result cap per tile/category** | Dense zones return incomplete data | Accepted by design; reallocation of tiles can improve coverage |
+| 2 | **Duplicate results across adjacent tiles** | Same `place_id` returned by overlapping crawl radii | Mitigated by UPSERT on `place_id`; no duplicate records |
+| 3 | **Google ranking bias** | Nearby Search returns Google-ranked subset, not deterministic full set | Accepted; dataset is directional, not exhaustive |
+| 4 | **Stale data between refresh cycles** | Business may close/change between weekly crawls | 90-day inactive flag + 180-day optional purge limits staleness |
+| 5 | **Tile cap may leave coverage gaps** | 180-tile hard cap cannot cover all GAM commercial zones | Accepted; tiles are reallocated based on density analysis, never added beyond 180 |
+| 6 | **Single API key failure** | If Google key is revoked or quota-exceeded, crawl stops entirely | `STOPPED_CAP` / `FAILED` status logged; manual intervention required |
