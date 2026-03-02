@@ -169,6 +169,17 @@ Deno.serve(async (req) => {
       0,
     ) ?? 0;
 
+    // PRD §5.3 pre-run monthly cap guard — reject run before it starts if budget exhausted
+    if (monthlyApiCalls >= MAX_API_CALLS) {
+      return json({
+        ok: true,
+        status: "STOPPED_CAP",
+        run_id: null,
+        reason: "MONTHLY_BUDGET_EXCEEDED",
+        monthly_api_calls: monthlyApiCalls,
+      });
+    }
+
     const staleThreshold = new Date(Date.now() - 10 * 60 * 1000).toISOString();
     await supabase
       .from("crawl_runs")
@@ -256,7 +267,10 @@ Deno.serve(async (req) => {
               allResults.push(...payload.results);
             }
 
-            nextPageToken = payload.next_page_token;
+            // PRD §5.2 budget model: 1 call per tile/category (20 results).
+          // Pagination is disabled — GAM density causes 3 pages × 33 tiles = 297 calls/week,
+          // exceeding the 400/month cap in ~1.4 runs. Top-20 results accepted per PRD §16.
+          nextPageToken = undefined;
             page += 1;
           } while (nextPageToken && page < 3);
 
