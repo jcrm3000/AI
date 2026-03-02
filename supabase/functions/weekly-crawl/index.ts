@@ -289,13 +289,27 @@ Deno.serve(async (req) => {
             });
 
           if (upserts.length > 0) {
-            const upsertResult = await supabase.from("businesses").upsert(upserts, {
-              onConflict: "place_id",
-              ignoreDuplicates: false,
-            });
+            // Sort by place_id for consistent lock acquisition order across
+            // concurrent tile workers — eliminates Postgres deadlock (40P01).
+            const sortedUpserts = [...upserts].sort((a, b) => a.place_id.localeCompare(b.place_id));
 
-            if (upsertResult.error) {
-              throw new Error(`Business upsert failed: ${upsertResult.error.message}`);
+            let upsertError: { message: string } | null = null;
+            for (let attempt = 0; attempt < 3; attempt++) {
+              const upsertResult = await supabase.from("businesses").upsert(sortedUpserts, {
+                onConflict: "place_id",
+                ignoreDuplicates: false,
+              });
+              if (!upsertResult.error) { upsertError = null; break; }
+              upsertError = upsertResult.error;
+              // Retry on deadlock (40P01) or serialization failure (40001)
+              const isRetryable = upsertResult.error.message.includes("deadlock") ||
+                upsertResult.error.message.includes("40P01") ||
+                upsertResult.error.message.includes("40001");
+              if (!isRetryable) break;
+              await sleep(100 * (attempt + 1));
+            }
+            if (upsertError) {
+              throw new Error(`Business upsert failed: ${upsertError.message}`);
             }
           }
 
